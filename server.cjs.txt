@@ -1,0 +1,259 @@
+const express = require("express");
+const xlsx = require("xlsx");
+const fs = require("fs");
+
+const app = express();
+const PORT = 3000;
+
+let holidayCache = []; // cached holidays
+
+/* ---------- Date helpers ---------- */
+function formatDateIST(date) {
+  const tzOffsetMs = date.getTimezoneOffset() * 60000;
+  const local = new Date(date.getTime() - tzOffsetMs);
+  return local.toISOString().slice(0, 10);
+}
+function isWeekend(date) {
+  const day = date.getDay();
+  return day === 0 || day === 6;
+}
+function isNonTradingDay(dateStr, holidays) {
+  const d = new Date(dateStr);
+  return isWeekend(d) || holidays.includes(dateStr);
+}
+function shiftToPreviousTradingDay(dateStr, holidays) {
+  let d = new Date(dateStr);
+  while (true) {
+    d.setDate(d.getDate() - 1);
+    const candidate = formatDateIST(d);
+    if (!isNonTradingDay(candidate, holidays)) return candidate;
+  }
+}
+
+/* ---------- Expiry generator ---------- */
+function generateExpiries(startDate, monthsAhead = 3) {
+  const expiries = [];
+  const start = new Date(startDate);
+
+  for (let m = 0; m < monthsAhead; m++) {
+    const firstOfMonth = new Date(start.getFullYear(), start.getMonth() + m, 1);
+    const month = firstOfMonth.getMonth();
+    const thursdays = [];
+
+    for (let d = new Date(firstOfMonth); d.getMonth() === month; d.setDate(d.getDate() + 1)) {
+      if (d.getDay() === 4) thursdays.push(new Date(d)); // Thursday
+    }
+
+    thursdays.forEach(t => expiries.push(formatDateIST(t)));
+
+    if (thursdays.length > 0) {
+      const lastThu = formatDateIST(thursdays[thursdays.length - 1]);
+      if (!expiries.includes(lastThu)) expiries.push(lastThu);
+    }
+  }
+
+  return Array.from(new Set(expiries)).sort();
+}
+
+/* ---------- Robust date parsing ---------- */
+// Excel serial -> JS Date
+function fromExcelSerial(n) {
+  // Excel's epoch is 1899-12-30 for Windows (accounting for 1900 leap-year bug)
+  const base = new Date(Date.UTC(1899, 11, 30));
+  const ms = n * 24 * 60 * 60 * 1000;
+  return new Date(base.getTime() + ms);
+}
+
+// Try multiple parsers
+function parseAnyDate(raw) {
+  if (raw == null) return null;
+
+  // Numeric serial (e.g., 45896)
+  if (typeof raw === "number" && isFinite(raw)) {
+    const d = fromExcelSerial(raw);
+    return isNaN(d) ? null : d;
+  }
+
+  // String cleanup
+  let s = String(raw).trim();
+  if (!s) return null;
+
+  // Common normalization: remove commas, collapse spaces
+  s = s.replace(/,/g, " ").replace(/\s+/g, " ").trim();
+
+  // Try JS Date
+  let d = new Date(s);
+  if (!isNaN(d)) return d;
+
+  // Try DD-MMM-YYYY explicitly
+  const ddMmmYy = /^(\d{1,2})-(\w{3})-(\d{2,4})$/i;
+  const m = s.match(ddMmmYy);
+  if (m) {
+    const day = parseInt(m[1], 10);
+    const monStr = m[2].toUpperCase();
+    const year = parseInt(m[3], 10) < 100 ? 2000 + parseInt(m[3], 10) : parseInt(m[3], 10);
+    const months = { JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11 };
+    if (months.hasOwnProperty(monStr)) {
+      d = new Date(year, months[monStr], day);
+      if (!isNaN(d)) return d;
+    }
+  }
+
+  // Try Month DD YYYY ("February 26 2025")
+  const monthWord = /^([A-Za-z]+)\s+(\d{1,2})\s+(\d{2,4})$/;
+  const mw = s.match(monthWord);
+  if (mw) {
+    d = new Date(`${mw[1]} ${mw[2]} ${mw[3]}`);
+    if (!isNaN(d)) return d;
+  }
+
+  // If all fail
+  return null;
+}
+
+/* ---------- Holiday loader (Excel, auto-detect column) ---------- */
+function loadHolidayFileAuto(filePath) {
+  const workbook = xlsx.readFile(filePath, { cellDates: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, raw: true });
+
+  if (!rows || rows.length === 0) {
+    console.warn("Excel sheet appears empty.");
+    return [];
+  }
+
+  // Heuristics: choose the column with most valid dates
+  const maxCols = Math.max(...rows.map(r => r.length));
+  let bestCol = 0;
+  let bestCount = 0;
+
+  for (let col = 0; col < maxCols; col++) {
+    let count = 0;
+    for (const row of rows) {
+      const val = row[col];
+      const parsed = parseAnyDate(val);
+      if (parsed) count++;
+    }
+    if (count > bestCount) {
+      bestCount = count;
+      bestCol = col;
+    }
+  }
+
+  if (bestCount === 0) {
+    console.warn("No parsable dates found in any column.");
+    return [];
+  }
+
+  const holidays = [];
+  for (const row of rows) {
+    const val = row[bestCol];
+    const parsed = parseAnyDate(val);
+    if (parsed) {
+      const normalized = formatDateIST(parsed);
+      holidays.push(normalized);
+      console.log("Parsed holiday:", val, "→", normalized);
+    } else if (val != null) {
+      console.warn("Skipped invalid date:", val);
+    }
+  }
+  return Array.from(new Set(holidays)).sort();
+}
+
+/* ---------- Bullet-proof fallback ---------- */
+function fallbackHolidaysForYear(year) {
+  // Minimal safety net for Sensex derivatives (adjust as needed).
+  // Include widely-observed markers to ensure shifting works even if Excel fails.
+  const known = {
+    2025: [
+      "2025-01-01", // New Year
+      "2025-03-14", // Holi (example; adjust per official list)
+      "2025-03-31", // Ramzan Id (example)
+      "2025-04-10",
+      "2025-04-14",
+      "2025-04-18",
+      "2025-05-01",
+      "2025-08-15",
+      "2025-08-27",
+      "2025-10-02",
+      "2025-10-21",
+      "2025-10-22",
+      "2025-11-05",
+      "2025-12-25"
+    ]
+  };
+  return (known[year] || []).slice();
+}
+
+/* ---------- Holiday refresh ---------- */
+function refreshHolidayCache() {
+  try {
+    const currentYear = new Date().getFullYear();
+    const holidayFile = `./BSE_Holidays_${currentYear}.xlsx`;
+
+    let loaded = [];
+    if (fs.existsSync(holidayFile)) {
+      loaded = loadHolidayFileAuto(holidayFile);
+      console.log("Holiday cache refreshed from Excel:", loaded.length, "entries");
+    } else {
+      console.log("No Excel file found for", currentYear, "→ trying fallback.");
+    }
+
+    if (!loaded || loaded.length === 0) {
+      const fallback = fallbackHolidaysForYear(currentYear);
+      if (fallback.length > 0) {
+        holidayCache = fallback;
+        console.warn("Using fallback holidays:", fallback.length, "entries");
+      } else {
+        holidayCache = [];
+        console.warn("No holidays available (Excel empty and no fallback).");
+      }
+    } else {
+      holidayCache = loaded;
+    }
+  } catch (err) {
+    console.error("Failed to refresh holiday cache:", err);
+    // Last resort: leave cache as-is
+  }
+}
+
+// Refresh once at startup
+refreshHolidayCache();
+
+/* ---------- Routes ---------- */
+app.get("/api/sensex/expiries", (req, res) => {
+  try {
+    const monthsAhead = Number(req.query.monthsAhead || 3);
+    const startDate = req.query.startDate || formatDateIST(new Date());
+
+    const expiries = generateExpiries(startDate, monthsAhead);
+    const adjusted = expiries.map(dateStr => {
+      if (isNonTradingDay(dateStr, holidayCache)) {
+        const shifted = shiftToPreviousTradingDay(dateStr, holidayCache);
+        console.log("Shifted expiry:", dateStr, "→", shifted);
+        return shifted;
+      }
+      return dateStr;
+    });
+
+    res.json({ expiries: adjusted, holidays: holidayCache });
+  } catch (err) {
+    console.error("Error generating Sensex expiries:", err);
+    res.status(500).json({ error: "Failed to generate Sensex expiries" });
+  }
+});
+
+// Endpoint: check holiday list directly
+app.get("/api/sensex/holidays", (req, res) => {
+  res.json({ holidays: holidayCache });
+});
+
+// Endpoint: force reload (useful while testing Excel changes)
+app.get("/api/sensex/reload-holidays", (req, res) => {
+  refreshHolidayCache();
+  res.json({ status: "reloaded", holidays: holidayCache });
+});
+
+app.listen(PORT, () => {
+  console.log(`Sensex test server running at http://localhost:${PORT}`);
+});
