@@ -1,5 +1,4 @@
 const express = require("express");
-const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const xlsx = require("xlsx");
@@ -45,29 +44,7 @@ function generateExpiries(startDate, monthsAhead = 3) {
   return Array.from(new Set(expiries)).sort();
 }
 
-/* ---------- Auto-fetch BSE holiday Excel ---------- */
-async function fetchBseHolidayExcel(year) {
-  return new Promise((resolve, reject) => {
-    const url = `https://www.bseindia.com/markets/MarketInfo/HolidayList.aspx?year=${year}`;
-    const filePath = path.join(__dirname, `BSE_Holidays_${year}.xlsx`);
-
-    const file = fs.createWriteStream(filePath);
-    https.get(url, response => {
-      if (response.statusCode !== 200) {
-        reject(new Error(`Failed to download holiday file: ${response.statusCode}`));
-        return;
-      }
-      response.pipe(file);
-      file.on("finish", () => {
-        file.close(() => resolve(filePath));
-      });
-    }).on("error", err => {
-      fs.unlink(filePath, () => reject(err));
-    });
-  });
-}
-
-/* ---------- Robust loader for Column A ---------- */
+/* ---------- Holiday loader ---------- */
 function loadHolidayFile(filePath) {
   const workbook = xlsx.readFile(filePath);
   const sheetName = workbook.SheetNames[0];
@@ -113,21 +90,16 @@ function fallbackHolidays(year) {
 }
 
 /* ---------- Refresh holiday cache ---------- */
-async function refreshHolidayCache() {
+function refreshHolidayCache() {
   const currentYear = new Date().getFullYear();
-  try {
-    const holidayFile = await fetchBseHolidayExcel(currentYear);
-    holidayCache = loadHolidayFile(holidayFile);
-    console.log(`Holiday cache refreshed from BSE Excel (${currentYear}):`, holidayCache.length, "entries");
-  } catch (err) {
-    console.warn("Download failed, using local file/fallback:", err.message);
-    const localFile = path.join(__dirname, `BSE_Holidays_${currentYear}.xlsx`);
-    if (fs.existsSync(localFile)) {
-      holidayCache = loadHolidayFile(localFile);
-    } else {
-      holidayCache = fallbackHolidays(currentYear);
-      lastDiag = { source: "fallback", year: currentYear, count: holidayCache.length };
-    }
+  const localFile = path.join(__dirname, `BSE_Holidays_${currentYear}.xlsx`);
+  if (fs.existsSync(localFile)) {
+    holidayCache = loadHolidayFile(localFile);
+    console.log(`Holiday cache loaded from local file (${currentYear}):`, holidayCache.length, "entries");
+  } else {
+    holidayCache = fallbackHolidays(currentYear);
+    lastDiag = { source: "fallback", year: currentYear, count: holidayCache.length };
+    console.warn("No local holiday file found, using fallback");
   }
 }
 
@@ -144,8 +116,8 @@ app.get("/api/sensex/debug", (req, res) => {
   res.json({ diagnostics: lastDiag });
 });
 
-app.get("/api/sensex/reload-holidays", async (req, res) => {
-  await refreshHolidayCache();
+app.get("/api/sensex/reload-holidays", (req, res) => {
+  refreshHolidayCache();
   res.json({ status: "reloaded", holidays: holidayCache, diagnostics: lastDiag });
 });
 
@@ -168,13 +140,6 @@ app.get("/api/sensex/expiries", (req, res) => {
 
 /* ---------- Startup ---------- */
 refreshHolidayCache();
-
-// Daily refresh (every 24h)
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-setInterval(() => {
-  console.log("Scheduled holiday cache refresh...");
-  refreshHolidayCache();
-}, ONE_DAY_MS);
 
 app.listen(PORT, () => {
   console.log(`Sensex expiry server running at http://localhost:${PORT}`);
