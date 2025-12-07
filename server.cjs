@@ -67,26 +67,40 @@ async function fetchBseHolidayExcel(year) {
   });
 }
 
+/* ---------- Robust loader for Column A ---------- */
 function loadHolidayFile(filePath) {
-  const workbook = xlsx.readFile(filePath, { cellDates: true });
+  const workbook = xlsx.readFile(filePath);
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
-  const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, raw: true });
+  const rows = xlsx.utils.sheet_to_json(sheet, { header: 1 });
 
   const holidays = [];
   rows.forEach(row => {
-    row.forEach(cell => {
-      const d = new Date(cell);
-      if (!isNaN(d)) {
-        holidays.push(formatDateIST(d));
+    const cell = row[0]; // only Column A
+    if (!cell) return;
+
+    let d;
+    if (cell instanceof Date) {
+      d = cell;
+    } else if (typeof cell === "string") {
+      d = new Date(cell.replace(/-/g, " "));
+    } else if (typeof cell === "number") {
+      const parsed = xlsx.SSF.parse_date_code(cell);
+      if (parsed) {
+        d = new Date(parsed.y, parsed.m - 1, parsed.d);
       }
-    });
+    }
+
+    if (d && !isNaN(d)) {
+      holidays.push(d.toISOString().slice(0, 10));
+    }
   });
 
   lastDiag = { source: "xlsx", filePath, count: holidays.length };
   return Array.from(new Set(holidays)).sort();
 }
 
+/* ---------- Fallback ---------- */
 function fallbackHolidays(year) {
   if (year === 2025) {
     return [
